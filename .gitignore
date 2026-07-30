@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Local data: audio in, text out, chunk cache in between.
+# The directories are tracked (via .gitkeep) but everything dropped into them
+# is ignored, so no recording or transcript can be committed by accident.
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+work/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editors
+.idea/
+.vscode/
+
+# OS / logs
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log

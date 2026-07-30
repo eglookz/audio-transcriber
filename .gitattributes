@@ -1,0 +1,12 @@
+# Normalise line endings in the repository, check out per platform.
+* text=auto eol=lf
+
+# Windows launchers must keep CRLF or cmd.exe mis-parses them.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries.
+*.m4a binary
+*.mp3 binary
+*.wav binary
+*.opus binary
