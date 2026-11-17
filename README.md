@@ -55,7 +55,7 @@ You can see what is happening and how much is left — every stage has its own p
 bar with an ETA:
 
 ```text
->> [1/2] Recording_2026-07-28.m4a  (2:47:13, 96.4 MB, ~$1.00)
+>> [1/2] Recording_2026-07-28.m4a  (2:47:13, 96.4 MB, ~$0.28)
    scan pauses  [████████████████████████] 100% 812 pauses | took 0:41
    812 pauses found -> 12 chunks of ~0:13:56
    cut chunks   [██████████░░░░░░░░░░░░░░]  41% 5/12 | ETA 1:12
@@ -97,9 +97,10 @@ python transcribe.py --model gpt-transcribe --prompt "Kubernetes, CI/CD"  # term
 | `--list-models` | —           | print what every model supports and exit                          |
 | `--language`    | `ru`        | ISO-639-1 language code, or `auto`                                |
 | `--prompt`      | —           | names, terms, spelling (OpenAI models only — OpenRouter drops it) |
-| `--speakers`    | —           | rename diarized speaker labels: `A=Alice,B=Client` (diarize only) |
+| `--diarize`     | —           | label who is speaking (with `mai`) — see Diarization below        |
+| `--speakers`    | —           | rename speaker labels: `0=Alice,1=Client` (with `--diarize`)      |
 | `--chunk`       | `900`       | target chunk length in seconds                                    |
-| `--workers`     | `4`         | number of parallel requests (`1` — sequential, with context)      |
+| `--workers`     | `4`         | parallel requests (`1` — sequential; OpenAI models carry context) |
 | `--input-dir`   | `./input`   | where to look for recordings                                      |
 | `--output-dir`  | `./output`  | where to write the text                                           |
 | `--work-dir`    | `./work`    | temporary chunks and cache                                        |
@@ -212,7 +213,7 @@ noticeably helps accuracy and speed on all of them.
 
 - Want the **most accurate text with subtitles** — the default, `mai`.
 - Want **clean text to read**, without "um" and "uh-huh" — `--model voxtral`.
-- Want to know **who is speaking** — `--model gpt-4o-transcribe-diarize`.
+- Want to know **who is speaking** — `--diarize` (with the default `mai`).
 - Need **term hints** via `--prompt` — an OpenAI model, e.g. `--model gpt-transcribe`.
 
 ## Diarization: who is speaking
@@ -222,25 +223,41 @@ tags every line with a speaker label. For a meeting or a call you get a dialogue
 a solid wall of text:
 
 ```powershell
-python transcribe.py --model gpt-4o-transcribe-diarize
+python transcribe.py --diarize
 ```
 
-By default speakers are labelled with letters:
+This uses MAI-Transcribe 2 (the default model) at its usual price, $0.10 per hour. The
+whole recording goes to the model **in one request** while it fits (up to ~100 minutes), so
+a speaker keeps the same label from the first minute to the last. A 40-minute consultation
+took 20 seconds. Speakers are numbered from `0`:
 
 ```text
-A: Afternoon — how's the release going?
-
-B: In testing, shipping tomorrow. One regression left.
-
-A: Good, keep me posted.
+[0:00:02] 1: There are kids whose puberty is barely noticeable.
+[0:00:08] 0: That's how it was with Raul, yes.
+[0:00:11] 1: You can still talk things through with them.
 ```
 
-The letters can be swapped for names — after the transcription, based on who actually
-turned out to be where:
+The numbers say nothing about who is who — the model numbers voices in whatever order it
+likes. Listen to (or read) the start, then name them:
+
+```powershell
+python transcribe.py --diarize --speakers 0=Mother,1=Consultant --force
+```
+
+A re-run pays again (pennies: $0.10 per hour) unless the first run had `--keep-work` — then
+the cached answer is reused for free. In the dialogue the other person's short "uh-huh" and "right" become separate lines, which keeps
+the turns honest but makes the text longer.
+
+Recordings longer than ~100 minutes are cut into pieces, and then labels restart in every
+piece — the script warns about that.
+
+### The OpenAI alternative
 
 ```powershell
 python transcribe.py --model gpt-4o-transcribe-diarize --speakers A=Alice,B=Client
 ```
+
+It labels speakers with letters, costs $0.36 per hour and is weaker on Russian.
 
 **An important limitation.** The model assigns speaker labels independently in each chunk,
 so `A` at the start of a recording and `A` an hour later are not necessarily the same
