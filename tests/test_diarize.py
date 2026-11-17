@@ -61,3 +61,72 @@ def test_speaker_zero_kept():
 
 def test_srt_shows_speaker_zero():
     assert "0: a" in t.render_srt([{"start": 0, "end": 1, "text": "a", "speaker": "0"}])
+
+
+class RecordingTranscriptions:
+    def __init__(self):
+        self.kwargs = []
+
+    def create(self, **kwargs):
+        self.kwargs.append(kwargs)
+
+        class Response:
+            def model_dump(self):
+                return {"text": "a b", "segments": [
+                    {"start": 0, "end": 1, "text": "a", "speaker": 0},
+                    {"start": 1, "end": 2, "text": "b", "speaker": 1}]}
+        return Response()
+
+
+def fake_client(recorder):
+    return type("C", (), {"audio": type("A", (), {"transcriptions": recorder})()})()
+
+
+def make_chunk(tmp_path, name="a"):
+    audio = tmp_path / f"{name}.mp3"
+    audio.write_bytes(b"x" * 4096)
+    return t.Chunk(0, 0.0, 2.0, audio, tmp_path / f"{name}.json")
+
+
+def test_transcribe_chunk_sends_diarize_options_only_when_asked(tmp_path):
+    recorder = RecordingTranscriptions()
+    t.transcribe_chunk(fake_client(recorder), make_chunk(tmp_path, "on"), MAI, "ru", None, diarize=True)
+    t.transcribe_chunk(fake_client(recorder), make_chunk(tmp_path, "off"), MAI, "ru", None)
+    on, off = recorder.kwargs
+    assert json.loads(on["extra_body"]["provider"])["options"]["azure"]["diarization"]["enabled"] is True
+    assert "extra_body" not in off
+
+
+def test_named_speaker_zero_reaches_all_outputs(tmp_path):
+    segments = [{"start": 0, "end": 1, "text": "a", "speaker": "0"},
+                {"start": 1, "end": 2, "text": "b", "speaker": "1"}]
+    t.rename_speakers(segments, {"0": "Мама"})
+    t.write_outputs(tmp_path, "x", [{"index": 0, "text": "a b", "segments": segments}], True)
+    assert (tmp_path / "x.txt").read_text(encoding="utf-8-sig").startswith("Мама: a")
+    assert "Мама: a" in (tmp_path / "x.srt").read_text(encoding="utf-8")
+    assert "] Мама: a" in (tmp_path / "x.timestamped.txt").read_text(encoding="utf-8-sig")
+
+
+def test_process_file_passes_diarize_to_request_and_cache(tmp_path, monkeypatch):
+    """--diarize must reach both the API call and the cache name, end to end."""
+    audio = tmp_path / "talk.mp3"
+    audio.write_bytes(b"x" * 4096)
+    calls = []
+    monkeypatch.setattr(t, "probe_duration", lambda path: 60.0)
+    monkeypatch.setattr(t, "detect_silences", lambda path, duration, show: [])
+    monkeypatch.setattr(t, "extract_chunk", lambda src, dst, s, e, bitrate="48k": dst.write_bytes(b"x" * 4096))
+    monkeypatch.setattr(t, "log", lambda message: None)
+
+    def fake_transcribe(client, chunk, model, language, prompt, diarize=False):
+        calls.append((chunk.cache_path.name, diarize))
+        return {"index": chunk.index, "start": chunk.start, "end": chunk.end,
+                "text": "a", "segments": [{"start": 0, "end": 1, "text": "a"}]}
+
+    monkeypatch.setattr(t, "transcribe_chunk", fake_transcribe)
+    common = [str(audio), "--output-dir", str(tmp_path / "out"), "--work-dir", str(tmp_path / "w"),
+              "--no-progress", "--force"]
+    t.process_file(audio, None, t.parse_args(common))
+    t.process_file(audio, None, t.parse_args(common + ["--diarize"]))
+    (plain_name, plain_flag), (diar_name, diar_flag) = calls
+    assert (plain_flag, diar_flag) == (False, True)
+    assert plain_name != diar_name
