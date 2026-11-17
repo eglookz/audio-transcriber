@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Transcribe long audio recordings (1-3+ hours, e.g. Android Recorder files)
-into text using the OpenAI Audio Transcriptions API.
+into text using speech-to-text models from OpenRouter (default) or OpenAI.
 
-The API accepts files up to 25 MB, so every recording is:
+Both APIs accept files up to 25 MB, so every recording is:
   1. probed for its duration (ffprobe),
   2. scanned for silence points (ffmpeg silencedetect),
   3. cut into chunks on those silence points (so no word is split in half),
@@ -14,12 +14,14 @@ Usage:
     python transcribe.py                       # every new file in ./input
     python transcribe.py record.m4a            # one specific file
     python transcribe.py --list-models         # compare the available models
-    python transcribe.py --language en --workers 6
-    python transcribe.py --model gpt-4o-transcribe
+    python transcribe.py --model voxtral       # alias: mai | voxtral | scribe
+    python transcribe.py --model x-ai/grok-stt-2.0   # any OpenRouter STT model
+    python transcribe.py --model whisper-1     # OpenAI directly
     python transcribe.py --model gpt-4o-transcribe-diarize --speakers A=Denis,B=Client
 
-Requires: ffmpeg + ffprobe on PATH, `pip install openai`, and an API key in
-OPENAI_API_KEY (env var or .env file next to this script).
+Requires: ffmpeg + ffprobe on PATH, `pip install openai`, and an API key:
+OPENROUTER_API_KEY for OpenRouter models, OPENAI_API_KEY for OpenAI ones
+(env var or .env file next to this script).
 """
 
 from __future__ import annotations
@@ -187,6 +189,23 @@ DEFAULT_MODEL = "microsoft/mai-transcribe-2"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_CATALOG_URL = f"{OPENROUTER_BASE_URL}/models?output_modalities=transcription"
+
+# Where each provider lives and which key it needs. Both speak the OpenAI
+# audio API, so one SDK client class serves both.
+PROVIDERS: dict[str, dict] = {
+    "openai": {
+        "base_url": None,
+        "key_env": "OPENAI_API_KEY",
+        "key_url": "https://platform.openai.com/api-keys",
+        "credits_url": "https://platform.openai.com/settings/organization/billing",
+    },
+    "openrouter": {
+        "base_url": OPENROUTER_BASE_URL,
+        "key_env": "OPENROUTER_API_KEY",
+        "key_url": "https://openrouter.ai/settings/keys",
+        "credits_url": "https://openrouter.ai/settings/credits",
+    },
+}
 
 
 def catalog_prices(data: dict) -> dict[str, float | None]:
@@ -1192,12 +1211,13 @@ def collect_inputs(paths: list[str], input_dir: Path) -> list[Path]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Transcribe long audio recordings with the OpenAI Audio API.",
+        description="Transcribe long audio recordings with OpenRouter or OpenAI speech-to-text models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("files", nargs="*", help="specific files or folders (default: everything in ./input)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(MODEL_SPECS),
-                        help="transcription model; run --list-models to compare them")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="transcription model: an alias (mai, voxtral, scribe), a built-in "
+                             "id, or any OpenRouter speech-to-text id; run --list-models")
     parser.add_argument("--list-models", action="store_true",
                         help="print what each model supports and exit")
     parser.add_argument("--language", default="ru",
@@ -1227,6 +1247,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="disable the progress bars (plain log lines only)")
 
     args = parser.parse_args(argv)
+    if not args.list_models:
+        try:
+            args.model = resolve_model(args.model)
+        except ValueError as error:
+            parser.error(str(error))
+    elif args.model not in MODEL_SPECS:
+        args.model = DEFAULT_MODEL      # --list-models never needs the chosen model
     if args.language and args.language.lower() in {"auto", "", "none"}:
         args.language = None
     args.workers = max(1, args.workers)
@@ -1256,19 +1283,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def print_model_table() -> None:
-    """Compare the transcription models the API currently exposes."""
-    log("Speech-to-text models available via the OpenAI audio API:\n")
-    header = f"  {'model':34} {'timestamps':11} {'speakers':9} {'prompt':7} {'$/min':7} note"
+    """Compare the built-in transcription models."""
+    log("Built-in speech-to-text models:\n")
+    aliases = {model: alias for alias, model in MODEL_ALIASES.items()}
+    header = (f"  {'model':39} {'alias':8} {'via':11} {'timestamps':11} {'speakers':9} "
+              f"{'prompt':7} {'$/min':8} note")
     log(header)
     log("  " + "-" * (len(header) - 2))
     for name, spec in MODEL_SPECS.items():
-        price = f"${spec.price_per_minute:g}" if spec.price_per_minute else "?"
-        log(f"  {name:34} {'yes' if spec.timestamps else 'no':11} "
+        price = f"${spec.price_per_minute:.4g}" if spec.price_per_minute else "?"
+        log(f"  {name:39} {aliases.get(name, ''):8} {spec.provider:11} "
+            f"{'yes' if spec.timestamps else 'no':11} "
             f"{'yes' if spec.diarizes else 'no':9} {'yes' if spec.supports_prompt else 'no':7} "
-            f"{price:7} {spec.note}")
-    log("\n  timestamps -> needed for .srt and .timestamped.txt output")
+            f"{price:8} {spec.note}")
+    log(f"\n  default    -> {DEFAULT_MODEL}")
+    log("  via        -> openai needs OPENAI_API_KEY, openrouter needs OPENROUTER_API_KEY")
+    log("  timestamps -> needed for .srt and .timestamped.txt output")
     log("  speakers   -> diarization: labels each turn with who said it (A, B, ...)")
-    log("  prices per https://developers.openai.com/api/docs/pricing (checked 2026-07-30)")
+    log("  prices: OpenAI per https://developers.openai.com/api/docs/pricing (2026-07-30),")
+    log("          OpenRouter per its models API (2026-11-17)")
+    log("  any other OpenRouter model works by its full id, e.g. --model x-ai/grok-stt-2.0;")
+    log("  browse them at https://openrouter.ai/collections/speech-to-text-models")
+
+
+class MissingKeyError(RuntimeError):
+    """The API key for the chosen model's provider is not configured."""
+
+
+def make_client(provider: str) -> OpenAI:
+    """An SDK client for `provider`, keyed from the environment or .env."""
+    config = PROVIDERS[provider]
+    load_dotenv(ROOT / ".env")
+    key_env = config["key_env"]
+    api_key = os.environ.get(key_env, "").strip()
+    if not api_key:
+        raise MissingKeyError(
+            f"{key_env} is not set (needed for {provider} models). Get a key at {config['key_url']}\n"
+            f"  PowerShell (this session):  $env:{key_env} = '...'\n"
+            f"  or put {key_env}=... into .env (see .env.example).")
+    # max_retries=1: this script does its own classified retries, and the
+    # SDK's blind ones only add delay before a fatal error surfaces.
+    # The generous timeout is for diarization, which is slow to answer.
+    return OpenAI(api_key=api_key, base_url=config["base_url"],
+                  max_retries=1, timeout=REQUEST_TIMEOUT)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1289,22 +1346,16 @@ def main(argv: list[str] | None = None) -> int:
             f"Recognised extensions: {', '.join(sorted(AUDIO_EXTENSIONS))}")
         return 0
 
+    spec = MODEL_SPECS[args.model]
     client = None
     if not args.dry_run:
-        load_dotenv(ROOT / ".env")
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            log("OPENAI_API_KEY is not set.\n"
-                "  PowerShell (this session):  $env:OPENAI_API_KEY = 'sk-...'\n"
-                "  or copy .env.example to .env and put the key there.")
+        try:
+            client = make_client(spec.provider)
+        except MissingKeyError as error:
+            log(str(error))
             return 2
-        # max_retries=1: this script does its own classified retries, and the
-        # SDK's blind ones only add delay before a fatal error surfaces.
-        # The generous timeout is for diarization, which is slow to answer.
-        client = OpenAI(api_key=api_key, max_retries=1, timeout=REQUEST_TIMEOUT)
 
-    spec = MODEL_SPECS[args.model]
-    log(f"Model: {args.model} | language: {args.language or 'auto'} | "
+    log(f"Model: {args.model} via {spec.provider} | language: {args.language or 'auto'} | "
         f"chunk: {args.chunk}s | workers: {args.workers} | files: {len(files)}")
     if args.prompt and not spec.supports_prompt:
         log(f"   warning: {args.model} does not accept --prompt, it will be ignored")
