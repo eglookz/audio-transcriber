@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import dataclasses
 import difflib
 import hashlib
 import json
@@ -106,6 +107,7 @@ class ModelSpec:
     note: str = ""
     provider: str = "openai"                # "openai" (direct) or "openrouter"
     word_timestamps: bool = False           # segments must be rebuilt from word timings
+    diarize_options: dict | None = None     # OpenRouter provider.options that turn on --diarize
 
 
 # price_per_minute follows https://developers.openai.com/api/docs/pricing
@@ -162,6 +164,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         response_format="verbose_json", timestamps=True,
         supports_prompt=False, supports_temperature=True,
         price_per_minute=0.00167, provider="openrouter",
+        diarize_options={"azure": {"diarization": {"enabled": True}}},
         note="best on Russian in our test; verbatim, splits the other speaker's turns",
     ),
     "mistralai/voxtral-small-transcribe-3-0": ModelSpec(
@@ -186,6 +189,20 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 DEFAULT_MODEL = "microsoft/mai-transcribe-2"
+
+# --diarize: the whole recording in one request while it fits, so speaker
+# labels stay consistent. 6000 s at 32 kbit/s is ~24 MB, under the 25 MB cap.
+DIARIZE_CHUNK_SECONDS = 4800
+DIARIZE_MAX_SECONDS = 6000
+
+
+def diarize_extra_body(options: dict) -> dict:
+    """Request fields that switch on a provider's diarization through OpenRouter.
+
+    The SDK sends audio as multipart, which silently drops a nested object, so
+    `provider` goes as a JSON string - OpenRouter parses it (checked 2026-11-17).
+    """
+    return {"provider": json.dumps({"options": options})}
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_CATALOG_URL = f"{OPENROUTER_BASE_URL}/models?output_modalities=transcription"
@@ -628,9 +645,13 @@ class Chunk:
         return f"[{self.index + 1:03d}] {fmt_duration(self.start)}-{fmt_duration(self.end)}"
 
 
-def request_signature(model: str, language: str | None, prompt: str | None) -> str:
+def request_signature(model: str, language: str | None, prompt: str | None,
+                      diarize: bool = False) -> str:
     """Identity of everything that changes what a transcription result means."""
-    raw = "|".join([model, language or "auto", prompt or ""])
+    parts = [model, language or "auto", prompt or ""]
+    if diarize:
+        parts.append("diarize")   # appended only when on, so existing caches keep their names
+    raw = "|".join(parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
@@ -730,7 +751,7 @@ def retry_after_seconds(error: Exception) -> float | None:
 DROPPABLE_OPTIONS = ("timestamp_granularities", "chunking_strategy", "temperature", "prompt", "language")
 
 
-PROTECTED_OPTIONS = {"model", "file"}
+PROTECTED_OPTIONS = {"model", "file", "extra_body"}   # never drop --diarize silently
 
 
 DURATION_LIMIT_RE = re.compile(r"longer than ([\d.]+) seconds")
@@ -873,7 +894,7 @@ def payload_segments(payload: dict, offset: float, end: float | None = None) -> 
             "end": float(segment.get("end", 0.0)) + offset,
             "text": (segment.get("text") or "").strip(),
         }
-        if segment.get("speaker"):
+        if segment.get("speaker") is not None:   # MAI numbers speakers from 0
             entry["speaker"] = str(segment["speaker"])
         segments.append(entry)
 
@@ -885,7 +906,7 @@ def payload_segments(payload: dict, offset: float, end: float | None = None) -> 
 
 
 def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | None,
-                     prompt: str | None) -> dict:
+                     prompt: str | None, diarize: bool = False) -> dict:
     """Send one chunk to the API and return {'text': str, 'segments': [...]}."""
     cached = read_cache(chunk)
     if cached is not None:
@@ -903,6 +924,8 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
         # Required by gpt-4o-transcribe-diarize for anything over 30 seconds:
         # the server normalizes loudness and picks boundaries by VAD itself.
         options["chunking_strategy"] = "auto"
+    if diarize and spec.diarize_options:
+        options["extra_body"] = diarize_extra_body(spec.diarize_options)
     if spec.word_timestamps:
         # Scribe returns one segment per request; words let us rebuild real ones.
         options["timestamp_granularities"] = ["word", "segment"]
@@ -1083,7 +1106,7 @@ def render_srt(segments: list[dict]) -> str:
         text = segment["text"].strip()
         if not text:
             continue
-        if segment.get("speaker"):
+        if segment.get("speaker") is not None:
             text = f"{segment['speaker']}: {text}"
         counter += 1
         end = max(segment["end"], segment["start"] + 0.2)
@@ -1176,7 +1199,8 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
     chunk_dir.mkdir(parents=True, exist_ok=True)
     bitrate = bitrate_for(args.chunk, spec.diarizes)
     signature = request_signature(args.model, args.language,
-                                  args.prompt if spec.supports_prompt else None)
+                                  args.prompt if spec.supports_prompt else None,
+                                  diarize=args.diarize)
     chunks = []
     for index, (start, end) in enumerate(spans):
         audio_path, cache_path = chunk_paths(chunk_dir, index, start, end, signature, bitrate)
@@ -1240,7 +1264,8 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
                 inflight += 1
             bar.set_note(status())
             try:
-                return transcribe_chunk(client, chunk, args.model, args.language, prompt)
+                return transcribe_chunk(client, chunk, args.model, args.language, prompt,
+                                        diarize=args.diarize)
             finally:
                 with counter_lock:
                     inflight -= 1
@@ -1324,8 +1349,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="ISO-639-1 code of the spoken language, or 'auto' to let the model decide")
     parser.add_argument("--prompt", default=None,
                         help="hint with names/terms/spelling to improve accuracy")
-    parser.add_argument("--speakers", default=None, metavar="A=Name,B=Name",
-                        help="rename diarized speaker labels in the output")
+    parser.add_argument("--diarize", action="store_true",
+                        help="label who is speaking (with --model mai; the whole recording goes "
+                             "in one request when it fits, so labels stay consistent)")
+    parser.add_argument("--speakers", default=None, metavar="0=Name,1=Name",
+                        help="rename speaker labels in the output (mai: 0,1,...; "
+                             "gpt-4o-transcribe-diarize: A,B,...)")
     parser.add_argument("--chunk", type=int, metavar="SECONDS", default=None,
                         help="override the target chunk length; without it each model's own "
                              "default is used (900 s), lowered further if the model caps a "
@@ -1359,13 +1388,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.workers = max(1, args.workers)
 
     spec = MODEL_SPECS[args.model]
+    if args.diarize and not spec.diarizes:
+        if spec.diarize_options is None:
+            capable = [alias for alias, model in MODEL_ALIASES.items()
+                       if MODEL_SPECS[model].diarize_options]
+            parser.error(f"--diarize is not available for {args.model}; use --model "
+                         f"{' / '.join(capable)} (or --model gpt-4o-transcribe-diarize)")
+        # One request per recording while it fits: speaker labels then stay
+        # consistent across the whole file instead of restarting every chunk.
+        spec = dataclasses.replace(spec, diarizes=True,
+                                   default_chunk_seconds=DIARIZE_CHUNK_SECONDS,
+                                   max_seconds=DIARIZE_MAX_SECONDS)
+        MODEL_SPECS[args.model] = spec
+
+    explicit_chunk = args.chunk is not None
     args.chunk = max(60, args.chunk) if args.chunk else spec.default_chunk_seconds
     if spec.max_seconds:
         # Keep target x CHUNK_MAX_FACTOR inside the model's per-request limit.
         allowed = int((spec.max_seconds - MODEL_LIMIT_MARGIN) / CHUNK_MAX_FACTOR)
         if args.chunk > allowed:
-            log(f"note: {args.model} accepts at most {spec.max_seconds:g}s of audio per request, "
-                f"lowering --chunk from {args.chunk} to {allowed}")
+            if explicit_chunk:
+                log(f"note: {args.model} accepts at most {spec.max_seconds:g}s of audio per "
+                    f"request, lowering --chunk from {args.chunk} to {allowed}")
             args.chunk = allowed
 
     mapping: dict[str, str] = {}
@@ -1376,8 +1420,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.speakers and not mapping:
         parser.error("--speakers expects pairs like  A=Denis,B=Client")
     if mapping and not spec.diarizes:
+        if spec.diarize_options is not None:
+            parser.error(f"--speakers needs speaker labels: add --diarize "
+                         f"(e.g. --diarize --speakers 0=Name,1=Name)")
         parser.error(f"--speakers only works with a diarizing model, and {args.model} is not one "
-                     "(use --model gpt-4o-transcribe-diarize)")
+                     "(use --model mai --diarize, or --model gpt-4o-transcribe-diarize)")
     args.speakers = mapping
     return args
 
