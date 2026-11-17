@@ -76,3 +76,16 @@ def test_unknown_openrouter_model_asks_for_word_timestamps():
     model = t.resolve_model("google/gemini-3.5-transcribe",
                             catalog_loader=lambda: {"google/gemini-3.5-transcribe": None})
     assert t.MODEL_SPECS[model].word_timestamps
+
+
+def test_plain_name_typo_suggests():
+    with pytest.raises(ValueError, match="scribe"):
+        t.resolve_model("scirbe")
+    with pytest.raises(ValueError, match="whisper-1"):
+        t.resolve_model("whispr-1")
+
+
+def test_catalog_any_failure_is_a_warning():
+    def broken():
+        raise KeyError("id")
+    assert t.resolve_model("acme/other-stt", catalog_loader=broken) == "acme/other-stt"
