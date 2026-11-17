@@ -19,7 +19,7 @@ def test_extra_body_is_json_string():
 
 def test_diarize_flag_switches_spec():
     args = t.parse_args(["--diarize"])
-    spec = t.MODEL_SPECS[args.model]
+    spec = args.spec
     assert args.diarize
     assert spec.diarizes
     assert spec.default_chunk_seconds == 4800
@@ -35,7 +35,7 @@ def test_diarize_rejected_for_unsupported_model(capsys):
 
 def test_diarize_is_noop_for_openai_diarize_model():
     args = t.parse_args(["--model", "gpt-4o-transcribe-diarize", "--diarize"])
-    assert t.MODEL_SPECS[args.model].max_seconds == 1400
+    assert args.spec.max_seconds == 1400
 
 
 def test_speakers_without_diarize_suggests_flag(capsys):
@@ -117,7 +117,7 @@ def test_process_file_passes_diarize_to_request_and_cache(tmp_path, monkeypatch)
     monkeypatch.setattr(t, "extract_chunk", lambda src, dst, s, e, bitrate="48k": dst.write_bytes(b"x" * 4096))
     monkeypatch.setattr(t, "log", lambda message: None)
 
-    def fake_transcribe(client, chunk, model, language, prompt, diarize=False):
+    def fake_transcribe(client, chunk, model, language, prompt, diarize=False, concurrent=True):
         calls.append((chunk.cache_path.name, diarize))
         return {"index": chunk.index, "start": chunk.start, "end": chunk.end,
                 "text": "a", "segments": [{"start": 0, "end": 1, "text": "a"}]}

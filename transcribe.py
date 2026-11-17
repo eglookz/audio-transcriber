@@ -699,6 +699,11 @@ class FatalAPIError(RuntimeError):
 # immediately instead of burning through the same failure in parallel.
 _ABORT = threading.Event()
 
+
+def _pause(seconds: float) -> None:
+    """Sleep before a retry, but wake at once when another chunk hit a fatal error."""
+    _ABORT.wait(seconds)
+
 FATAL_HINTS = {
     "insufficient_quota":
         "the OpenAI account is out of credit (insufficient_quota). Failed requests are "
@@ -770,7 +775,7 @@ def retry_after_seconds(error: Exception) -> float | None:
 DROPPABLE_OPTIONS = ("timestamp_granularities", "chunking_strategy", "temperature", "prompt", "language")
 
 
-PROTECTED_OPTIONS = {"model", "file", "extra_body"}   # never drop --diarize silently
+PROTECTED_OPTIONS = {"model", "file", "extra_body"}   # SDK plumbing, never an API complaint
 
 
 DURATION_LIMIT_RE = re.compile(r"longer than ([\d.]+) seconds")
@@ -797,21 +802,23 @@ def api_message(error: Exception) -> str:
     return str(getattr(error, "message", None) or error).strip()
 
 
-def drop_unsupported_option(options: dict, error: Exception) -> str | None:
+def drop_unsupported_option(options: dict, error: Exception,
+                            keep: set[str] = frozenset()) -> str | None:
     """Remove whichever optional parameter the API complained about.
 
     Returns the removed key, or None if the error is about something else.
     """
     # Most reliable: the API names the offending parameter in error.param.
+    blocked = PROTECTED_OPTIONS | set(keep)
     param = str(getattr(error, "param", None) or "").strip()
-    if param in options and param not in PROTECTED_OPTIONS:
+    if param in options and param not in blocked:
         options.pop(param)
         return param
 
     message = api_message(error).lower()
     # Next best: a parameter name in quotes, e.g. "Unknown parameter: 'language'".
     for quoted in re.findall(r"['\"]([a-z_]+)['\"]", message):
-        if quoted in options and quoted not in PROTECTED_OPTIONS:
+        if quoted in options and quoted not in blocked:
             options.pop(quoted)
             return quoted
 
@@ -819,7 +826,8 @@ def drop_unsupported_option(options: dict, error: Exception) -> str | None:
         if key in options and key in message:
             options.pop(key)
             return key
-    if "response_format" in message and options.get("response_format") != "json":
+    if ("response_format" in message and options.get("response_format") != "json"
+            and "response_format" not in keep):
         options["response_format"] = "json"   # last resort: plain text, no timestamps
         return "response_format"
     return None
@@ -901,7 +909,8 @@ def payload_segments(payload: dict, offset: float, end: float | None = None) -> 
     """
     raw_segments = payload.get("segments") or []
     words = payload.get("words") or []
-    if words and len(raw_segments) <= 1:
+    has_speakers = any(segment.get("speaker") is not None for segment in raw_segments)
+    if words and len(raw_segments) <= 1 and not has_speakers:
         from_words = segments_from_words(words, offset)
         if from_words:
             return from_words
@@ -925,8 +934,12 @@ def payload_segments(payload: dict, offset: float, end: float | None = None) -> 
 
 
 def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | None,
-                     prompt: str | None, diarize: bool = False) -> dict:
-    """Send one chunk to the API and return {'text': str, 'segments': [...]}."""
+                     prompt: str | None, diarize: bool = False, concurrent: bool = True) -> dict:
+    """Send one chunk to the API and return {'text': str, 'segments': [...]}.
+
+    `diarize` asks the provider for speaker labels; `concurrent` says whether other
+    chunks are in flight at the same time (it only shapes the advice in errors).
+    """
     cached = read_cache(chunk)
     if cached is not None:
         return cached
@@ -971,7 +984,9 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
             # model capabilities change faster than this script does.
             if getattr(error, "status_code", None) == 400:
                 if adaptations < MAX_ADAPTATIONS:
-                    dropped = drop_unsupported_option(options, error)
+                    # Plain json has no segments, so it would silently lose the speakers.
+                    keep = {"response_format"} if "extra_body" in options else set()
+                    dropped = drop_unsupported_option(options, error, keep=keep)
                     if dropped:
                         adaptations += 1
                         log(f"  {chunk.label} {model} rejected '{dropped}', retrying without it")
@@ -994,14 +1009,16 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
             if is_in_flight_wait(error):
                 inflight_waits += 1
                 if inflight_waits > MAX_INFLIGHT_WAITS:
+                    advice = ("Re-run with --workers 1, or add credits" if concurrent else
+                              "Add credits or raise this key's limit")
                     raise RuntimeError(
-                        f"{chunk.label}: OpenRouter kept refusing parallel requests for this "
-                        f"balance ({api_message(error)}). Re-run with --workers 1, or add "
-                        f"credits at {PROVIDERS['openrouter']['credits_url']}") from error
+                        f"{chunk.label}: OpenRouter kept refusing the request for this balance "
+                        f"({api_message(error)}). {advice} at "
+                        f"{PROVIDERS['openrouter']['credits_url']}") from error
                 delay = retry_after_seconds(error) or 30.0
                 log(f"  {chunk.label} waiting {delay:g}s: too many requests in flight "
                     "for the OpenRouter balance")
-                time.sleep(delay)
+                _pause(delay)
                 continue
 
             attempt += 1
@@ -1011,7 +1028,7 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
             delay = retry_after_seconds(error) or min(60, 4 * 2 ** (attempt - 1))
             log(f"  {chunk.label} attempt {attempt} failed "
                 f"({type(error).__name__}: {api_message(error)[:120]}), retrying in {delay:g}s")
-            time.sleep(delay)
+            _pause(delay)
 
     payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
     segments = payload_segments(payload, chunk.start, chunk.end)
@@ -1211,7 +1228,10 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
     work_dir = Path(args.work_dir) / stem
     chunk_dir = work_dir / "chunks"
 
-    spec = MODEL_SPECS[args.model]
+    spec = args.spec
+    # Only a model with provider diarize options changes its request for --diarize
+    # (gpt-4o-transcribe-diarize labels speakers anyway), so only then does the cache.
+    diarize = bool(args.diarize and spec.diarize_options)
     duration = probe_duration(path)
     size_mb = path.stat().st_size / 1e6
     price = spec.price_per_minute
@@ -1225,6 +1245,10 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
     spans = plan_cut_points(duration, silences, float(args.chunk), hard_max)
     log(f"   {len(silences)} pauses found -> {len(spans)} chunks of "
         f"~{fmt_duration(duration / max(1, len(spans)))}")
+    if spec.diarizes and len(spans) > 1:
+        # Said before any money is spent: the model labels each request on its own.
+        log(f"   note: {len(spans)} requests needed, and speaker labels restart in each, "
+            "so the same label in different parts may be a different person")
 
     if args.dry_run:
         for index, (start, end) in enumerate(spans):
@@ -1235,7 +1259,7 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
     bitrate = bitrate_for(args.chunk, spec.diarizes)
     signature = request_signature(args.model, args.language,
                                   args.prompt if spec.supports_prompt else None,
-                                  diarize=args.diarize)
+                                  diarize=diarize)
     chunks = []
     for index, (start, end) in enumerate(spans):
         audio_path, cache_path = chunk_paths(chunk_dir, index, start, end, signature, bitrate)
@@ -1305,7 +1329,8 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
             bar.set_note(status())
             try:
                 return transcribe_chunk(client, chunk, args.model, args.language, prompt,
-                                        diarize=args.diarize)
+                                        diarize=diarize,
+                                        concurrent=min(args.workers, len(pending)) > 1)
             finally:
                 with counter_lock:
                     inflight -= 1
@@ -1335,9 +1360,9 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
     if spec.diarizes:
         voices = sorted({s["speaker"] for r in ordered for s in r["segments"] if s.get("speaker")})
         log(f"   speakers: {', '.join(voices) if voices else 'none detected'}")
-        if len(chunks) > 1:
-            log("   note: speaker labels are assigned per chunk, so the same letter in "
-                "different parts of a long file may be a different person")
+        if voices and not args.speakers:
+            example = ",".join(f"{voice}=Name" for voice in voices[:2])
+            log(f"   tip: name them with --speakers {example}")
     for out in written:
         log(f"   -> {out}")
     if not spec.timestamps:
@@ -1397,8 +1422,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "gpt-4o-transcribe-diarize: A,B,...)")
     parser.add_argument("--chunk", type=int, metavar="SECONDS", default=None,
                         help="override the target chunk length; without it each model's own "
-                             "default is used (900 s), lowered further if the model caps a "
-                             "single request")
+                             "default is used (900 s; 4792 s with --diarize), lowered further "
+                             "if the model caps a single request")
     parser.add_argument("--workers", type=int, default=4,
                         help="parallel API requests; 1 = sequential (OpenAI models then also carry "
                              "the previous chunk forward as context)")
@@ -1440,7 +1465,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         spec = dataclasses.replace(spec, diarizes=True,
                                    default_chunk_seconds=DIARIZE_CHUNK_SECONDS,
                                    max_seconds=DIARIZE_MAX_SECONDS)
-        MODEL_SPECS[args.model] = spec
+    args.spec = spec          # the effective spec for this run; MODEL_SPECS stays as built
 
     explicit_chunk = args.chunk is not None
     args.chunk = max(60, args.chunk) if args.chunk else spec.default_chunk_seconds
@@ -1459,7 +1484,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if label.strip() and name.strip():
             mapping[label.strip()] = name.strip()
     if args.speakers and not mapping:
-        parser.error("--speakers expects pairs like  A=Denis,B=Client")
+        parser.error("--speakers expects pairs like  0=Denis,1=Client  (mai --diarize) "
+                     "or  A=Denis,B=Client  (gpt-4o-transcribe-diarize)")
     if mapping and not spec.diarizes:
         if spec.diarize_options is not None:
             parser.error(f"--speakers needs speaker labels: add --diarize "
@@ -1468,6 +1494,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      "(use --model mai --diarize, or --model gpt-4o-transcribe-diarize)")
     args.speakers = mapping
     return args
+
+
+def speakers_cell(spec: ModelSpec) -> str:
+    """'yes' if the model always labels speakers, '--diarize' if it can on request."""
+    if spec.diarizes:
+        return "yes"
+    return "--diarize" if spec.diarize_options else "no"
 
 
 def print_model_table() -> None:
@@ -1482,21 +1515,25 @@ def print_model_table() -> None:
         price = f"${spec.price_per_minute:.4g}" if spec.price_per_minute else "?"
         log(f"  {name:39} {aliases.get(name, ''):8} {spec.provider:11} "
             f"{'yes' if spec.timestamps else 'no':11} "
-            f"{'yes' if spec.diarizes else 'no':9} {'yes' if spec.supports_prompt else 'no':7} "
+            f"{speakers_cell(spec):9} {'yes' if spec.supports_prompt else 'no':7} "
             f"{price:8} {spec.note}")
     log(f"\n  default    -> {DEFAULT_MODEL}")
     log("  via        -> openai needs OPENAI_API_KEY, openrouter needs OPENROUTER_API_KEY")
     log("  timestamps -> needed for .srt and .timestamped.txt output")
-    log("  speakers   -> diarization: labels each turn with who said it (A, B, ...)")
+    log("  speakers   -> diarization: labels each turn with who said it "
+        "(A, B, ... or 0, 1, ... with --diarize)")
     log("  prices: OpenAI per https://developers.openai.com/api/docs/pricing (2026-07-30),")
     log("          OpenRouter per its models API (2026-11-17)")
     log("  any other OpenRouter model works by its full id, e.g. --model x-ai/grok-stt-2.0;")
     log("  browse them at https://openrouter.ai/collections/speech-to-text-models")
 
 
-def other_provider_hint(provider: str) -> str:
+def other_provider_hint(provider: str, diarize: bool = False) -> str:
     """Point at a model the user can already run, when only the other key is set."""
     if provider == "openrouter" and os.environ.get(PROVIDERS["openai"]["key_env"], "").strip():
+        if diarize:
+            return ("\n  OPENAI_API_KEY is set, so you can label speakers with OpenAI instead: "
+                    "--model gpt-4o-transcribe-diarize")
         return ("\n  OPENAI_API_KEY is set, so you can keep using OpenAI instead: "
                 "--model whisper-1 (the previous default)")
     return ""
@@ -1506,7 +1543,7 @@ class MissingKeyError(RuntimeError):
     """The API key for the chosen model's provider is not configured."""
 
 
-def make_client(provider: str) -> OpenAI:
+def make_client(provider: str, diarize: bool = False) -> OpenAI:
     """An SDK client for `provider`, keyed from the environment or .env."""
     config = PROVIDERS[provider]
     load_dotenv(ROOT / ".env")
@@ -1517,7 +1554,7 @@ def make_client(provider: str) -> OpenAI:
             f"{key_env} is not set (needed for {provider} models). Get a key at {config['key_url']}\n"
             f"  PowerShell (this session):  $env:{key_env} = '...'\n"
             f"  or put {key_env}=... into .env (see .env.example)."
-            + other_provider_hint(provider))
+            + other_provider_hint(provider, diarize))
     # max_retries=1: this script does its own classified retries, and the
     # SDK's blind ones only add delay before a fatal error surfaces.
     # The generous timeout is for diarization, which is slow to answer.
@@ -1543,11 +1580,11 @@ def main(argv: list[str] | None = None) -> int:
             f"Recognised extensions: {', '.join(sorted(AUDIO_EXTENSIONS))}")
         return 0
 
-    spec = MODEL_SPECS[args.model]
+    spec = args.spec
     client = None
     if not args.dry_run:
         try:
-            client = make_client(spec.provider)
+            client = make_client(spec.provider, diarize=args.diarize)
         except MissingKeyError as error:
             log(str(error))
             return 2
