@@ -70,3 +70,9 @@ def test_catalog_price_parsing():
     prices = t.catalog_prices(data)
     assert prices["a/sec"] == pytest.approx(0.00166667, rel=1e-3)
     assert prices["b/tok"] is None
+
+
+def test_unknown_openrouter_model_asks_for_word_timestamps():
+    model = t.resolve_model("google/gemini-3.5-transcribe",
+                            catalog_loader=lambda: {"google/gemini-3.5-transcribe": None})
+    assert t.MODEL_SPECS[model].word_timestamps
