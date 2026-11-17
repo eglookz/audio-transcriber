@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import difflib
 import hashlib
 import json
 import os
@@ -101,6 +102,8 @@ class ModelSpec:
     max_seconds: float | None = None        # hard per-request audio limit, if any
     price_per_minute: float | None = None   # rough estimate, see note below
     note: str = ""
+    provider: str = "openai"                # "openai" (direct) or "openrouter"
+    word_timestamps: bool = False           # segments must be rebuilt from word timings
 
 
 # price_per_minute follows https://developers.openai.com/api/docs/pricing
@@ -150,9 +153,101 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         price_per_minute=0.006,
         note="labels who is speaking; ignores --prompt; max 1400 s per request",
     ),
+    # OpenRouter models. Picked by a side-by-side test on Russian meetings and
+    # consultations (2026-11-17); prices from the OpenRouter models API.
+    # OpenRouter drops `prompt`, so none of them takes --prompt.
+    "microsoft/mai-transcribe-2": ModelSpec(
+        response_format="verbose_json", timestamps=True,
+        supports_prompt=False, supports_temperature=True,
+        price_per_minute=0.00167, provider="openrouter",
+        note="best on Russian in our test; verbatim, splits the other speaker's turns",
+    ),
+    "mistralai/voxtral-small-transcribe-3-0": ModelSpec(
+        response_format="verbose_json", timestamps=True,
+        supports_prompt=False, supports_temperature=True,
+        price_per_minute=0.004, provider="openrouter",
+        note="cleanest text (drops um/uh), sometimes garbles crosstalk",
+    ),
+    "elevenlabs/scribe-v2": ModelSpec(
+        response_format="verbose_json", timestamps=True,
+        supports_prompt=False, supports_temperature=True,
+        price_per_minute=0.00367, provider="openrouter", word_timestamps=True,
+        note="fluent, but may swap in plausible wrong words",
+    ),
 }
 
-DEFAULT_MODEL = "whisper-1"
+# Short names for the models that won the comparison.
+MODEL_ALIASES: dict[str, str] = {
+    "mai": "microsoft/mai-transcribe-2",
+    "voxtral": "mistralai/voxtral-small-transcribe-3-0",
+    "scribe": "elevenlabs/scribe-v2",
+}
+
+DEFAULT_MODEL = "microsoft/mai-transcribe-2"
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_CATALOG_URL = f"{OPENROUTER_BASE_URL}/models?output_modalities=transcription"
+
+
+def catalog_prices(data: dict) -> dict[str, float | None]:
+    """Model id -> $ per minute from an OpenRouter models listing.
+
+    Duration-priced models carry a per-second `prompt` price; token-priced ones
+    also carry `completion`, and their per-minute cost cannot be known upfront.
+    """
+    prices: dict[str, float | None] = {}
+    for model in data.get("data") or []:
+        pricing = model.get("pricing") or {}
+        try:
+            per_second = float(pricing.get("prompt") or 0)
+            per_token_out = float(pricing.get("completion") or 0)
+        except (TypeError, ValueError):
+            per_second, per_token_out = 0.0, 0.0
+        prices[model["id"]] = per_second * 60 if per_second and not per_token_out else None
+    return prices
+
+
+def fetch_openrouter_catalog(timeout: float = 20.0) -> dict[str, float | None]:
+    """Every speech-to-text model OpenRouter offers. Raises OSError when offline."""
+    import urllib.request
+    with urllib.request.urlopen(OPENROUTER_CATALOG_URL, timeout=timeout) as response:
+        return catalog_prices(json.load(response))
+
+
+def resolve_model(name: str, catalog_loader=fetch_openrouter_catalog) -> str:
+    """Turn an alias or model id into a full id that is present in MODEL_SPECS.
+
+    A `vendor/model` id that is not built in is checked against OpenRouter's
+    catalog and registered with a generic spec, so any OpenRouter model works.
+    """
+    model = MODEL_ALIASES.get(name.strip().lower(), name.strip())
+    if model in MODEL_SPECS:
+        return model
+    if "/" not in model:
+        raise ValueError(f"unknown model '{name}'. Run --list-models to see the choices, "
+                         "or pass a full OpenRouter id such as x-ai/grok-stt-2.0")
+
+    price: float | None = None
+    try:
+        catalog = catalog_loader()
+    except (OSError, ValueError) as error:
+        log(f"warning: could not check '{model}' against the OpenRouter catalog ({error}); "
+            "trying it anyway")
+    else:
+        if model not in catalog:
+            close = difflib.get_close_matches(model, list(catalog), n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(close)}?" if close else ""
+            raise ValueError(f"OpenRouter has no speech-to-text model '{model}'.{hint} "
+                             "See https://openrouter.ai/collections/speech-to-text-models")
+        price = catalog[model]
+
+    MODEL_SPECS[model] = ModelSpec(
+        response_format="verbose_json", timestamps=True,
+        supports_prompt=False, supports_temperature=True,
+        price_per_minute=price, provider="openrouter",
+        note="any OpenRouter model; falls back to plain text if it has no timestamps",
+    )
+    return model
 
 MAX_ATTEMPTS = 4                     # per chunk, on top of the SDK's own retries
 MAX_ADAPTATIONS = 3                  # optional params dropped after an API 400
