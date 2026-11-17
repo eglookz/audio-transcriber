@@ -1,11 +1,12 @@
 # audio-transcriber
 
 Turn long audio recordings (1–3 hours and more — Android voice recorder files and the
-like) into text using the OpenAI Audio API.
+like) into text using speech-to-text models from [OpenRouter](https://openrouter.ai)
+(MAI-Transcribe 2 by default) or the OpenAI Audio API.
 
 *Читать по-русски: [README.ru.md](README.ru.md)*
 
-The API accepts files no larger than 25 MB, so every recording is automatically:
+The APIs accept files no larger than 25 MB, so every recording is automatically:
 
 1. measured (`ffprobe`),
 2. scanned for pauses (`ffmpeg silencedetect`),
@@ -22,15 +23,22 @@ winget install Gyan.FFmpeg
 # 2. Python dependencies
 pip install -r requirements.txt
 
-# 3. API key: copy .env.example to .env and paste your key
+# 3. API keys: copy .env.example to .env and paste your keys
 copy .env.example .env
 ```
 
-The key can also come from an environment variable instead of `.env`:
+Which key you need depends on the model:
+
+- `OPENROUTER_API_KEY` — for the default model and every other OpenRouter model
+  (get one at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys));
+- `OPENAI_API_KEY` — only for the OpenAI models (`whisper-1`, `gpt-transcribe`,
+  `gpt-4o-transcribe-diarize`, …).
+
+The keys can also come from environment variables instead of `.env`:
 
 ```powershell
-$env:OPENAI_API_KEY = "sk-proj-..."          # current session only
-setx OPENAI_API_KEY "sk-proj-..."            # permanently (needs a new terminal)
+$env:OPENROUTER_API_KEY = "sk-or-v1-..."     # current session only
+setx OPENROUTER_API_KEY "sk-or-v1-..."       # permanently (needs a new terminal)
 ```
 
 ## Usage
@@ -74,19 +82,21 @@ python transcribe.py --workers 8                 # faster (8 parallel requests)
 python transcribe.py --workers 1                 # slower, but with context between chunks
 python transcribe.py --force                     # overwrite an existing result
 python transcribe.py --list-models               # what models exist and what they can do
-python transcribe.py --model gpt-transcribe      # most accurate text (no timecodes)
+python transcribe.py --model voxtral             # cleanest text (aliases: mai, voxtral, scribe)
+python transcribe.py --model x-ai/grok-stt-2.0   # any OpenRouter speech-to-text model by id
+python transcribe.py --model whisper-1           # OpenAI directly, the previous default
 python transcribe.py --model gpt-4o-transcribe-diarize      # label who is speaking
-python transcribe.py --prompt "Kubernetes, CI/CD, Grafana"  # hint for names and terms
+python transcribe.py --model gpt-transcribe --prompt "Kubernetes, CI/CD"  # term hints (OpenAI only)
 ```
 
 ### All options
 
 | Option          | Default     | Purpose                                                           |
 | --------------- | ----------- | ----------------------------------------------------------------- |
-| `--model`       | `whisper-1` | which model recognises the speech — see the table below           |
+| `--model`       | `mai`       | which model recognises the speech — see the table below           |
 | `--list-models` | —           | print what every model supports and exit                          |
 | `--language`    | `ru`        | ISO-639-1 language code, or `auto`                                |
-| `--prompt`      | —           | names, terms, spelling — noticeably improves accuracy             |
+| `--prompt`      | —           | names, terms, spelling (OpenAI models only — OpenRouter drops it) |
 | `--speakers`    | —           | rename diarized speaker labels: `A=Alice,B=Client` (diarize only) |
 | `--chunk`       | `900`       | target chunk length in seconds                                    |
 | `--workers`     | `4`         | number of parallel requests (`1` — sequential, with context)      |
@@ -116,18 +126,19 @@ is not processed again without `--force`.
 
 The script tells API errors apart by meaning:
 
-- **transient** (a real `429` rate limit, `500`, a dropped connection) — retried with a
-  growing delay, honouring the `Retry-After` header;
+- **transient** (a real `429` rate limit, `500`, a dropped connection, OpenRouter's `402`
+  for too many requests in flight at once) — retried with a growing delay, honouring
+  `Retry-After`;
 - **unsupported parameter** (`400`) — the parameter is dropped and the request repeated;
-- **hopeless** — out of credit (`insufficient_quota`), a bad key (`401`), no access to the
-  model (`404`): retrying is pointless, so the script stops immediately, explains what to
-  do, and does not push the remaining chunks through the same failure.
-  Failed requests are not billed.
+- **hopeless** — out of credit (`insufficient_quota`, or OpenRouter's `402`), a bad key
+  (`401`), no access to the model (`404`): retrying is pointless, so the script stops
+  immediately, explains what to do, and does not push the remaining chunks through the
+  same failure. Failed requests are not billed.
 
 ## Cost and time
 
-- `whisper-1` — **$0.006 per minute** of audio: an hour ≈ $0.36, three hours ≈ $1.08.
-  `gpt-transcribe` is cheaper — $0.0045/min, three hours ≈ $0.81.
+- `mai` (the default) — **$0.10 per hour** of audio: three hours ≈ $0.30.
+  `voxtral` — $0.24/hour, `scribe` — $0.22/hour, `whisper-1` — $0.36/hour.
   The script prints an estimate for the chosen model before it starts.
 - Time: with `--workers 4`, three hours of audio take roughly 5–10 minutes.
 
@@ -135,20 +146,47 @@ The script tells API errors apart by meaning:
 
 Compare them straight from the script: `python transcribe.py --list-models`
 
-| Model                               | Timecodes | Speakers | `--prompt` | $/min   |
-| ----------------------------------- | --------- | -------- | ---------- | ------- |
-| `whisper-1` (default)               | yes       | no       | yes        | $0.006  |
-| `gpt-transcribe`                    | no        | no       | yes        | $0.0045 |
-| `gpt-4o-transcribe`                 | no        | no       | yes        | $0.006  |
-| `gpt-4o-mini-transcribe`            | no        | no       | yes        | $0.003  |
-| `gpt-4o-mini-transcribe-2025-12-15` | no        | no       | yes        | $0.003  |
-| `gpt-4o-transcribe-diarize`         | yes       | yes      | no         | $0.006  |
+| Model                                                | Via        | Timecodes | Speakers | `--prompt` | $/hour |
+| ---------------------------------------------------- | ---------- | --------- | -------- | ---------- | ------ |
+| `microsoft/mai-transcribe-2` (`mai`, default)        | OpenRouter | yes       | no       | no         | $0.10  |
+| `mistralai/voxtral-small-transcribe-3-0` (`voxtral`) | OpenRouter | yes       | no       | no         | $0.24  |
+| `elevenlabs/scribe-v2` (`scribe`)                    | OpenRouter | yes       | no       | no         | $0.22  |
+| `whisper-1`                                          | OpenAI     | yes       | no       | yes        | $0.36  |
+| `gpt-transcribe`                                     | OpenAI     | no        | no       | yes        | $0.27  |
+| `gpt-4o-transcribe`                                  | OpenAI     | no        | no       | yes        | $0.36  |
+| `gpt-4o-mini-transcribe`                             | OpenAI     | no        | no       | yes        | $0.18  |
+| `gpt-4o-mini-transcribe-2025-12-15`                  | OpenAI     | no        | no       | yes        | $0.18  |
+| `gpt-4o-transcribe-diarize`                          | OpenAI     | yes       | yes      | no         | $0.36  |
 
-What that means in practice:
+Any other OpenRouter speech-to-text model works too — pass its full id, e.g.
+`--model x-ai/grok-stt-2.0` (see the
+[collection](https://openrouter.ai/collections/speech-to-text-models)). The script checks
+the id against OpenRouter's catalog before spending anything, suggests the closest match on
+a typo, and asks for word timings so that `.srt` comes out whenever the model can do it.
 
-- **`whisper-1`** — Whisper V2. The only model that returns timecodes for each segment,
-  which is why `.srt` and `.timestamped.txt` are produced with it only. This is the
-  default.
+### How the OpenRouter models were picked
+
+They won a side-by-side test on real Russian recordings (a noisy two-person business
+meeting and two clean consultations; ten models, the same fragments):
+
+- **`mai`** — the most faithful: names and rare words come out right, the other person's
+  short replies ("uh-huh", "right") become separate lines. Writes fillers ("um", "uh")
+  verbatim. Took a 26-minute file in one request in 29 seconds.
+- **`voxtral`** — the cleanest text: drops fillers and backchannel. Occasionally garbles
+  overlapping speech or loses punctuation for a stretch.
+- **`scribe`** — fluent and readable, but now and then swaps in a plausible wrong word
+  ("five seas" instead of "five names", "don't close" instead of "don't open") — the
+  hardest kind of error to spot. Timecodes are rebuilt from its per-word timings.
+- `whisper-1` is fine on clean audio and clearly weaker on meetings; `gpt-transcribe` and
+  Gemini dropped a "not" here and there (flipping the meaning) and give no timecodes;
+  `openai/whisper-large-v3` invented whole phrases.
+
+OpenRouter ignores `--prompt`, so with these models the hint is skipped with a warning.
+
+### OpenAI models
+
+- **`whisper-1`** — Whisper V2. Returns timecodes for each segment, so `.srt` and
+  `.timestamped.txt` are produced. The default before the OpenRouter models arrived.
 - **`gpt-transcribe`** — the newest and most accurate model for files, and cheaper than
   Whisper at that. Returns no timecodes: you get a single `.txt`. Pick it when you want the
   most accurate text and don't need subtitles.
@@ -172,15 +210,10 @@ SDK versions do.
 Every model in the table supports Russian, and passing `--language ru` (the default)
 noticeably helps accuracy and speed on all of them.
 
-- Want the **most accurate text** — `--model gpt-transcribe`. Cheaper than Whisper, too.
-- Want **timecodes or subtitles** — `--model whisper-1` (the default). Whisper is less
-  accurate on Russian than the GPT models, but it is the only one that gives you `.srt`.
+- Want the **most accurate text with subtitles** — the default, `mai`.
+- Want **clean text to read**, without "um" and "uh-huh" — `--model voxtral`.
 - Want to know **who is speaking** — `--model gpt-4o-transcribe-diarize`.
-- Want it **cheap at volume** — `--model gpt-4o-mini-transcribe`.
-
-For Russian recordings `--prompt` helps especially: list the names, titles and terms that
-appear in them, because without a hint the model spells them by ear and inconsistently
-from one place to another.
+- Need **term hints** via `--prompt` — an OpenAI model, e.g. `--model gpt-transcribe`.
 
 ## Diarization: who is speaking
 
@@ -228,10 +261,11 @@ compactly (32 kbit/s), and the timeout is raised to 20 minutes per request.
 
 - Android voice recorder files (`.m4a`, `.amr`, `.3gp`, `.opus`, `.wav`, …) are read
   directly, no manual conversion needed — every chunk is encoded to mono 16 kHz MP3.
-- `--prompt` with the names, titles and acronyms from the recording tangibly reduces the
-  number of mistakes in how they are spelled.
-- `--workers 1` passes the tail of the previous chunk forward as context to the next one:
-  slightly more coherent text across the seams, but processing is sequential and slower.
+- With OpenAI models, `--prompt` with the names, titles and acronyms from the recording
+  tangibly reduces the number of mistakes in how they are spelled.
+- With OpenAI models, `--workers 1` passes the tail of the previous chunk forward as
+  context to the next one: slightly more coherent text across the seams, but processing is
+  sequential and slower.
 - If a recording is very quiet and the cut comes out "hard" (few pauses found in the log),
   lowering `--chunk` helps, e.g. `--chunk 600`.
 

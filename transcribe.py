@@ -1250,7 +1250,7 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
         log(f"   -> {out}")
     if not spec.timestamps:
         log(f"   note: {args.model} returns no timestamps, so only .txt was produced "
-            "(use --model whisper-1 for .srt subtitles)")
+            "(use --model mai or whisper-1 for .srt subtitles)")
 
     if not args.keep_work:
         shutil.rmtree(work_dir, ignore_errors=True)
