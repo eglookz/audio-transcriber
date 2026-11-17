@@ -746,7 +746,14 @@ def api_message(error: Exception) -> str:
     """The human-readable message the API returned, without the JSON wrapper."""
     body = getattr(error, "body", None)
     if isinstance(body, dict) and body.get("message"):
-        return str(body["message"]).strip()
+        message = str(body["message"]).strip()
+        # OpenRouter wraps upstream failures as "Provider returned error" and
+        # keeps the provider's own words in metadata.raw - that is the useful part.
+        raw = error_metadata(error).get("raw")
+        if raw:
+            raw_text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+            message = f"{message}: {raw_text.strip()[:500]}"
+        return message
     return str(getattr(error, "message", None) or error).strip()
 
 
@@ -756,7 +763,7 @@ def drop_unsupported_option(options: dict, error: Exception) -> str | None:
     Returns the removed key, or None if the error is about something else.
     """
     # Most reliable: the API names the offending parameter in error.param.
-    param = (getattr(error, "param", None) or "").strip()
+    param = str(getattr(error, "param", None) or "").strip()
     if param in options and param not in PROTECTED_OPTIONS:
         options.pop(param)
         return param
@@ -802,6 +809,15 @@ WORD_SEGMENT_HARD_MAX = 30.0   # never let a segment grow longer than this
 SENTENCE_END = (".", "?", "!", "…")
 
 
+def has_timing(word: dict) -> bool:
+    """True when a word carries numeric start/end (some providers leave them null)."""
+    try:
+        float(word["start"]), float(word["end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def segments_from_words(words: list[dict], offset: float) -> list[dict]:
     """Group word timings into subtitle-sized segments, shifted by `offset` seconds.
 
@@ -822,7 +838,7 @@ def segments_from_words(words: list[dict], offset: float) -> list[dict]:
             current.clear()
 
     for word in words:
-        if not (word.get("word") or "").strip():
+        if not (word.get("word") or "").strip() or not has_timing(word):
             continue
         if current:
             start = float(current[0]["start"])
@@ -837,12 +853,18 @@ def segments_from_words(words: list[dict], offset: float) -> list[dict]:
     return segments
 
 
-def payload_segments(payload: dict, offset: float) -> list[dict]:
-    """Absolute-time segments from an API response, rebuilt from words if needed."""
+def payload_segments(payload: dict, offset: float, end: float | None = None) -> list[dict]:
+    """Absolute-time segments from an API response, rebuilt from words if needed.
+
+    A response with text but no timings at all becomes one segment spanning
+    the chunk [offset, end], so its text is never dropped from the output.
+    """
     raw_segments = payload.get("segments") or []
     words = payload.get("words") or []
     if words and len(raw_segments) <= 1:
-        return segments_from_words(words, offset)
+        from_words = segments_from_words(words, offset)
+        if from_words:
+            return from_words
 
     segments = []
     for segment in raw_segments:
@@ -854,6 +876,11 @@ def payload_segments(payload: dict, offset: float) -> list[dict]:
         if segment.get("speaker"):
             entry["speaker"] = str(segment["speaker"])
         segments.append(entry)
+
+    text = (payload.get("text") or "").strip()
+    if not segments and text:
+        segments.append({"start": float(offset),
+                         "end": float(end if end is not None else offset), "text": text})
     return segments
 
 
@@ -929,7 +956,7 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
             time.sleep(delay)
 
     payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-    segments = payload_segments(payload, chunk.start)
+    segments = payload_segments(payload, chunk.start, chunk.end)
 
     result = {
         "index": chunk.index,
