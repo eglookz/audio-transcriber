@@ -263,7 +263,7 @@ def resolve_model(name: str, catalog_loader=fetch_openrouter_catalog) -> str:
     MODEL_SPECS[model] = ModelSpec(
         response_format="verbose_json", timestamps=True,
         supports_prompt=False, supports_temperature=True,
-        price_per_minute=price, provider="openrouter",
+        price_per_minute=price, provider="openrouter", word_timestamps=True,
         note="any OpenRouter model; falls back to plain text if it has no timestamps",
     )
     return model
@@ -796,6 +796,67 @@ def read_cache(chunk: Chunk) -> dict | None:
     return cached
 
 
+WORD_PAUSE_SPLIT = 0.8         # seconds of silence between words that start a new segment
+WORD_SEGMENT_SOFT_MAX = 15.0   # past this length, split after the next sentence end
+WORD_SEGMENT_HARD_MAX = 30.0   # never let a segment grow longer than this
+SENTENCE_END = (".", "?", "!", "…")
+
+
+def segments_from_words(words: list[dict], offset: float) -> list[dict]:
+    """Group word timings into subtitle-sized segments, shifted by `offset` seconds.
+
+    For models (Scribe) that time every word but return the whole chunk as one
+    segment: a new segment starts on a pause, after a sentence once the current
+    one is long, and in any case before it would exceed the hard maximum.
+    """
+    segments: list[dict] = []
+    current: list[dict] = []
+
+    def flush() -> None:
+        if current:
+            segments.append({
+                "start": float(current[0]["start"]) + offset,
+                "end": float(current[-1]["end"]) + offset,
+                "text": " ".join(word["word"].strip() for word in current),
+            })
+            current.clear()
+
+    for word in words:
+        if not (word.get("word") or "").strip():
+            continue
+        if current:
+            start = float(current[0]["start"])
+            pause = float(word["start"]) - float(current[-1]["end"])
+            long_enough = float(current[-1]["end"]) - start >= WORD_SEGMENT_SOFT_MAX
+            sentence_over = current[-1]["word"].strip().endswith(SENTENCE_END)
+            too_long = float(word["end"]) - start > WORD_SEGMENT_HARD_MAX
+            if pause >= WORD_PAUSE_SPLIT or (long_enough and sentence_over) or too_long:
+                flush()
+        current.append(word)
+    flush()
+    return segments
+
+
+def payload_segments(payload: dict, offset: float) -> list[dict]:
+    """Absolute-time segments from an API response, rebuilt from words if needed."""
+    raw_segments = payload.get("segments") or []
+    words = payload.get("words") or []
+    if words and len(raw_segments) <= 1:
+        return segments_from_words(words, offset)
+
+    segments = []
+    for segment in raw_segments:
+        entry = {
+            "start": float(segment.get("start", 0.0)) + offset,
+            "end": float(segment.get("end", 0.0)) + offset,
+            "text": (segment.get("text") or "").strip(),
+        }
+        if segment.get("speaker"):
+            entry["speaker"] = str(segment["speaker"])
+        segments.append(entry)
+    return segments
+
+
 def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | None,
                      prompt: str | None) -> dict:
     """Send one chunk to the API and return {'text': str, 'segments': [...]}."""
@@ -815,6 +876,9 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
         # Required by gpt-4o-transcribe-diarize for anything over 30 seconds:
         # the server normalizes loudness and picks boundaries by VAD itself.
         options["chunking_strategy"] = "auto"
+    if spec.word_timestamps:
+        # Scribe returns one segment per request; words let us rebuild real ones.
+        options["timestamp_granularities"] = ["word", "segment"]
 
     attempt = 0
     adaptations = 0
@@ -865,16 +929,7 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
             time.sleep(delay)
 
     payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-    segments = []
-    for segment in payload.get("segments") or []:
-        entry = {
-            "start": float(segment.get("start", 0.0)) + chunk.start,
-            "end": float(segment.get("end", 0.0)) + chunk.start,
-            "text": (segment.get("text") or "").strip(),
-        }
-        if segment.get("speaker"):
-            entry["speaker"] = str(segment["speaker"])
-        segments.append(entry)
+    segments = payload_segments(payload, chunk.start)
 
     result = {
         "index": chunk.index,
