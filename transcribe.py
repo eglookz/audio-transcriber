@@ -211,12 +211,14 @@ OPENROUTER_CATALOG_URL = f"{OPENROUTER_BASE_URL}/models?output_modalities=transc
 # audio API, so one SDK client class serves both.
 PROVIDERS: dict[str, dict] = {
     "openai": {
+        "name": "OpenAI",
         "base_url": None,
         "key_env": "OPENAI_API_KEY",
         "key_url": "https://platform.openai.com/api-keys",
         "credits_url": "https://platform.openai.com/settings/organization/billing",
     },
     "openrouter": {
+        "name": "OpenRouter",
         "base_url": OPENROUTER_BASE_URL,
         "key_env": "OPENROUTER_API_KEY",
         "key_url": "https://openrouter.ai/settings/keys",
@@ -286,6 +288,7 @@ def resolve_model(name: str, catalog_loader=fetch_openrouter_catalog) -> str:
     return model
 
 MAX_ATTEMPTS = 4                     # per chunk, on top of the SDK's own retries
+MAX_INFLIGHT_WAITS = 10              # OpenRouter 402 "too many in flight" waits per chunk
 MAX_ADAPTATIONS = 3                  # optional params dropped after an API 400
 TICK_SECONDS = 1.0                   # progress-bar refresh while waiting on the API
 HEARTBEAT_SECONDS = 30               # keep-alive line when output is redirected
@@ -706,6 +709,12 @@ def error_metadata(error: Exception) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def is_in_flight_wait(error: Exception) -> bool:
+    """OpenRouter's 402 for too many concurrent requests on a small balance."""
+    return (getattr(error, "status_code", None) == 402
+            and error_metadata(error).get("reason") == "in_flight_budget_exhausted")
+
+
 def fatal_reason(error: Exception, model: str) -> str | None:
     """Explain why retrying is pointless, or None if the error is worth a retry."""
     spec = MODEL_SPECS.get(model)
@@ -715,17 +724,18 @@ def fatal_reason(error: Exception, model: str) -> str | None:
     status = getattr(error, "status_code", None)
     if status == 402:
         # Too many requests in flight for the balance: they settle, then it works.
-        if error_metadata(error).get("reason") == "in_flight_budget_exhausted":
+        if is_in_flight_wait(error):
             return None
-        return (f"the {model} provider account is out of credit ({api_message(error)}). "
-                f"Add funds at {provider['credits_url']} then re-run - the chunks already "
-                "cut are reused.")
+        return (f"your {provider['name']} balance or this key's spending limit is used up "
+                f"({api_message(error)}). Add funds at {provider['credits_url']} or raise the "
+                "key limit, then re-run - the chunks already cut are reused.")
     if code in FATAL_HINTS:
         return FATAL_HINTS[code]
     if status == 401 or code == "invalid_api_key":
         return f"{provider['key_env']} was rejected. Check the key at {provider['key_url']}"
     if status == 403:
-        return "this account or region is not allowed to use the transcription endpoint."
+        return (f"{provider['name']} refused the request (403): {api_message(error)}. "
+                "This can be the account, the region or content moderation.")
     if status == 404:
         return (f"model '{model}' does not exist or is not enabled for this account. "
                 "Run --list-models and pick another one.")
@@ -932,6 +942,7 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
 
     attempt = 0
     adaptations = 0
+    inflight_waits = 0
     while True:
         if _ABORT.is_set():
             raise FatalAPIError("stopped after a fatal API error on another chunk")
@@ -968,6 +979,21 @@ def transcribe_chunk(client: OpenAI, chunk: Chunk, model: str, language: str | N
                     f"{model} rejected the request for {chunk.label} and retrying will not help.\n"
                     f"  API said: {api_message(error)}\n{advice}"
                 ) from error
+
+            # Too many requests in flight for the balance: wait for them to settle.
+            # Not a failure, so it does not use up the chunk's real attempts.
+            if is_in_flight_wait(error):
+                inflight_waits += 1
+                if inflight_waits > MAX_INFLIGHT_WAITS:
+                    raise RuntimeError(
+                        f"{chunk.label}: OpenRouter kept refusing parallel requests for this "
+                        f"balance ({api_message(error)}). Re-run with --workers 1, or add "
+                        f"credits at {PROVIDERS['openrouter']['credits_url']}") from error
+                delay = retry_after_seconds(error) or 30.0
+                log(f"  {chunk.label} waiting {delay:g}s: too many requests in flight "
+                    "for the OpenRouter balance")
+                time.sleep(delay)
+                continue
 
             attempt += 1
             if attempt >= MAX_ATTEMPTS:
