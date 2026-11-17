@@ -1400,7 +1400,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "default is used (900 s), lowered further if the model caps a "
                              "single request")
     parser.add_argument("--workers", type=int, default=4,
-                        help="parallel API requests; 1 = sequential with carried-over context")
+                        help="parallel API requests; 1 = sequential (OpenAI models then also carry "
+                             "the previous chunk forward as context)")
     parser.add_argument("--input-dir", default=str(DEFAULT_INPUT_DIR),
                         help="where to look for recordings")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR),
