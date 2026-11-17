@@ -262,14 +262,16 @@ def resolve_model(name: str, catalog_loader=fetch_openrouter_catalog) -> str:
     if model in MODEL_SPECS:
         return model
     if "/" not in model:
-        raise ValueError(f"unknown model '{name}'. Run --list-models to see the choices, "
+        close = difflib.get_close_matches(model, [*MODEL_ALIASES, *MODEL_SPECS], n=3, cutoff=0.6)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        raise ValueError(f"unknown model '{name}'.{hint} Run --list-models to see the choices, "
                          "or pass a full OpenRouter id such as x-ai/grok-stt-2.0")
 
     price: float | None = None
     try:
         catalog = catalog_loader()
-    except (OSError, ValueError) as error:
-        log(f"warning: could not check '{model}' against the OpenRouter catalog ({error}); "
+    except Exception as error:  # noqa: BLE001 - an optional check must never stop the run
+        log(f"warning: could not check '{model}' against the OpenRouter catalog ({error!r}); "
             "trying it anyway")
     else:
         if model not in catalog:
@@ -670,6 +672,13 @@ def chunk_paths(chunk_dir: Path, index: int, start: float, end: float,
     audio = chunk_dir / f"{index:03d}_{stamp}_{CHUNK_SAMPLE_RATE}_{bitrate}.mp3"
     cache = chunk_dir / f"{index:03d}_{stamp}_{signature}.json"
     return audio, cache
+
+
+def foreign_cache_count(chunk_dir: Path, signature: str) -> int:
+    """Cached results in `chunk_dir` made with other request settings (model, language...)."""
+    if not chunk_dir.is_dir():
+        return 0
+    return sum(1 for path in chunk_dir.glob("*.json") if not path.stem.endswith(f"_{signature}"))
 
 
 def prune_stale_audio(chunk_dir: Path, keep: set[str]) -> int:
@@ -1248,6 +1257,11 @@ def process_file(path: Path, client: OpenAI, args: argparse.Namespace,
             results[chunk.index] = cached
     if results:
         log(f"   {len(results)}/{len(chunks)} chunks restored from cache ({chunk_dir})")
+    else:
+        foreign = foreign_cache_count(chunk_dir, signature)
+        if foreign:
+            log(f"   note: {foreign} chunk(s) in {chunk_dir} were transcribed with other settings "
+                "(model, language, prompt or --diarize); re-run with those to reuse them free")
 
     if pending:
         with Progress(len(pending), "cut chunks  ", enabled=show_progress) as bar:
@@ -1479,6 +1493,14 @@ def print_model_table() -> None:
     log("  browse them at https://openrouter.ai/collections/speech-to-text-models")
 
 
+def other_provider_hint(provider: str) -> str:
+    """Point at a model the user can already run, when only the other key is set."""
+    if provider == "openrouter" and os.environ.get(PROVIDERS["openai"]["key_env"], "").strip():
+        return ("\n  OPENAI_API_KEY is set, so you can keep using OpenAI instead: "
+                "--model whisper-1 (the previous default)")
+    return ""
+
+
 class MissingKeyError(RuntimeError):
     """The API key for the chosen model's provider is not configured."""
 
@@ -1493,7 +1515,8 @@ def make_client(provider: str) -> OpenAI:
         raise MissingKeyError(
             f"{key_env} is not set (needed for {provider} models). Get a key at {config['key_url']}\n"
             f"  PowerShell (this session):  $env:{key_env} = '...'\n"
-            f"  or put {key_env}=... into .env (see .env.example).")
+            f"  or put {key_env}=... into .env (see .env.example)."
+            + other_provider_hint(provider))
     # max_retries=1: this script does its own classified retries, and the
     # SDK's blind ones only add delay before a fatal error surfaces.
     # The generous timeout is for diarization, which is slow to answer.

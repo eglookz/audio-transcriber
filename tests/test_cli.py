@@ -48,3 +48,20 @@ def test_list_models_shows_aliases_and_providers(capsys):
     out = capsys.readouterr().out
     assert "mai" in out and "openrouter" in out and "whisper-1" in out
     assert "openrouter.ai/collections/speech-to-text-models" in out
+
+
+def test_missing_openrouter_key_suggests_whisper_when_openai_key_present(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(t, "load_dotenv", lambda path: None)
+    with pytest.raises(t.MissingKeyError, match="--model whisper-1"):
+        t.make_client("openrouter")
+
+
+def test_foreign_cache_count(tmp_path):
+    (tmp_path / "000_000000000-000060000_aaaaaaaa.json").write_text("{}")
+    (tmp_path / "001_000060000-000120000_aaaaaaaa.json").write_text("{}")
+    (tmp_path / "000_000000000-000060000_bbbbbbbb.json").write_text("{}")
+    (tmp_path / "000_000000000-000060000_16000_48k.mp3").write_bytes(b"")
+    assert t.foreign_cache_count(tmp_path, "aaaaaaaa") == 1
+    assert t.foreign_cache_count(tmp_path / "missing", "aaaaaaaa") == 0
