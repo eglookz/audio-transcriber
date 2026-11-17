@@ -87,7 +87,7 @@ def test_in_flight_waits_do_not_burn_attempts(monkeypatch, tmp_path):
     audio = tmp_path / "a.mp3"
     audio.write_bytes(b"x" * 4096)
     chunk = t.Chunk(0, 0.0, 1.0, audio, tmp_path / "a.json")
-    monkeypatch.setattr(t.time, "sleep", lambda s: None)
+    monkeypatch.setattr(t, "_pause", lambda s: None)
     monkeypatch.setattr(t, "log", lambda m: None)
     assert t.transcribe_chunk(client, chunk, MAI, "ru", None)["text"] == "ок"
 
@@ -103,7 +103,7 @@ def test_too_many_in_flight_waits_suggest_one_worker(monkeypatch, tmp_path):
     audio = tmp_path / "a.mp3"
     audio.write_bytes(b"x" * 4096)
     chunk = t.Chunk(0, 0.0, 1.0, audio, tmp_path / "a.json")
-    monkeypatch.setattr(t.time, "sleep", lambda s: None)
+    monkeypatch.setattr(t, "_pause", lambda s: None)
     monkeypatch.setattr(t, "log", lambda m: None)
     with pytest.raises(RuntimeError, match="--workers 1"):
         t.transcribe_chunk(client, chunk, MAI, "ru", None)

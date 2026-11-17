@@ -99,7 +99,7 @@ python transcribe.py --model gpt-transcribe --prompt "Kubernetes, CI/CD"  # term
 | `--prompt`      | —           | names, terms, spelling (OpenAI models only — OpenRouter drops it) |
 | `--diarize`     | —           | label who is speaking (with `mai`) — see Diarization below        |
 | `--speakers`    | —           | rename speaker labels: `0=Alice,1=Client` (with `--diarize`)      |
-| `--chunk`       | `900`       | target chunk length in seconds                                    |
+| `--chunk`       | `900`       | target chunk length in seconds (`4792` with `--diarize`)          |
 | `--workers`     | `4`         | parallel requests (`1` — sequential; OpenAI models carry context) |
 | `--input-dir`   | `./input`   | where to look for recordings                                      |
 | `--output-dir`  | `./output`  | where to write the text                                           |
@@ -249,7 +249,7 @@ the cached answer is reused for free. In the dialogue the other person's short "
 the turns honest but makes the text longer.
 
 Recordings longer than ~100 minutes are cut into pieces, and then labels restart in every
-piece — the script warns about that.
+piece — the script warns about that before sending anything.
 
 ### The OpenAI alternative
 

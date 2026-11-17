@@ -12,6 +12,8 @@ import transcribe  # noqa: E402
 def isolated_model_specs():
     """resolve_model and --diarize register specs globally; undo that after each test."""
     saved = dict(transcribe.MODEL_SPECS)
+    transcribe._ABORT.clear()
     yield
+    transcribe._ABORT.clear()      # a fatal-error test must not stop the next one
     transcribe.MODEL_SPECS.clear()
     transcribe.MODEL_SPECS.update(saved)
