@@ -671,8 +671,6 @@ FATAL_HINTS = {
         "the OpenAI account is out of credit (insufficient_quota). Failed requests are "
         "not billed. Add funds at https://platform.openai.com/settings/organization/billing "
         "then re-run - the chunks already cut are reused.",
-    "invalid_api_key":
-        "OPENAI_API_KEY was rejected. Check the key at https://platform.openai.com/api-keys",
     "account_deactivated":
         "this OpenAI account is deactivated.",
     "model_not_found":
@@ -680,14 +678,31 @@ FATAL_HINTS = {
 }
 
 
+def error_metadata(error: Exception) -> dict:
+    """OpenRouter's `metadata` object from an error body, or {}."""
+    body = getattr(error, "body", None)
+    metadata = body.get("metadata") if isinstance(body, dict) else None
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def fatal_reason(error: Exception, model: str) -> str | None:
     """Explain why retrying is pointless, or None if the error is worth a retry."""
-    code = (getattr(error, "code", None) or "").strip()
+    spec = MODEL_SPECS.get(model)
+    provider = PROVIDERS[spec.provider if spec else "openai"]
+    # OpenRouter reports numeric codes (402), OpenAI string ones (insufficient_quota).
+    code = str(getattr(error, "code", None) or "").strip()
+    status = getattr(error, "status_code", None)
+    if status == 402:
+        # Too many requests in flight for the balance: they settle, then it works.
+        if error_metadata(error).get("reason") == "in_flight_budget_exhausted":
+            return None
+        return (f"the {model} provider account is out of credit ({api_message(error)}). "
+                f"Add funds at {provider['credits_url']} then re-run - the chunks already "
+                "cut are reused.")
     if code in FATAL_HINTS:
         return FATAL_HINTS[code]
-    status = getattr(error, "status_code", None)
-    if status == 401:
-        return FATAL_HINTS["invalid_api_key"]
+    if status == 401 or code == "invalid_api_key":
+        return f"{provider['key_env']} was rejected. Check the key at {provider['key_url']}"
     if status == 403:
         return "this account or region is not allowed to use the transcription endpoint."
     if status == 404:
@@ -701,6 +716,9 @@ def retry_after_seconds(error: Exception) -> float | None:
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", None)
     value = headers.get("retry-after") if headers else None
+    if not value:
+        # OpenRouter also repeats it inside the error body.
+        value = (error_metadata(error).get("headers") or {}).get("Retry-After")
     try:
         return min(120.0, float(value)) if value else None
     except (TypeError, ValueError):
